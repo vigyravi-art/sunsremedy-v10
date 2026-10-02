@@ -10,6 +10,7 @@ from psycopg.rows import dict_row
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 DATABASE_URL = os.getenv("DATABASE_URL")
