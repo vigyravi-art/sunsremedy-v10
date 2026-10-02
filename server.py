@@ -360,6 +360,143 @@ def dashboard(user=Depends(current_user)):
     }
 
 
+@app.get("/api/reports")
+def reports(month: Optional[str] = None, user=Depends(current_user)):
+    """Detailed manager report for a selected YYYY-MM month."""
+    manager_only(user)
+
+    if month:
+        try:
+            current_start = date.fromisoformat(month + "-01")
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid month. Use YYYY-MM")
+    else:
+        current_start = datetime.now(ZoneInfo("Asia/Kolkata")).date().replace(day=1)
+
+    if current_start.month == 12:
+        next_start = date(current_start.year + 1, 1, 1)
+    else:
+        next_start = date(current_start.year, current_start.month + 1, 1)
+
+    with db() as conn:
+        summary = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(amount),0) AS sales,
+                COUNT(*) AS sale_count
+            FROM sales
+            WHERE sale_date >= %s AND sale_date < %s
+            """,
+            (current_start, next_start),
+        ).fetchone()
+
+        expense_summary = conn.execute(
+            """
+            SELECT
+                COALESCE(SUM(amount),0) AS expenses,
+                COUNT(*) AS expense_count
+            FROM expenses
+            WHERE expense_date >= %s AND expense_date < %s
+            """,
+            (current_start, next_start),
+        ).fetchone()
+
+        daily_sales = conn.execute(
+            """
+            SELECT sale_date AS day,
+                   COUNT(*) AS visits,
+                   COALESCE(SUM(amount),0) AS sales
+            FROM sales
+            WHERE sale_date >= %s AND sale_date < %s
+            GROUP BY sale_date
+            ORDER BY sale_date ASC
+            """,
+            (current_start, next_start),
+        ).fetchall()
+
+        payment_methods = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(TRIM(payment_method), ''), 'Not specified') AS payment_method,
+                   COUNT(*) AS visits,
+                   COALESCE(SUM(amount),0) AS sales
+            FROM sales
+            WHERE sale_date >= %s AND sale_date < %s
+            GROUP BY COALESCE(NULLIF(TRIM(payment_method), ''), 'Not specified')
+            ORDER BY SUM(amount) DESC, payment_method
+            """,
+            (current_start, next_start),
+        ).fetchall()
+
+        staff = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(TRIM(staff), ''), 'Not specified') AS staff,
+                   COUNT(*) AS visits,
+                   COALESCE(SUM(amount),0) AS sales
+            FROM sales
+            WHERE sale_date >= %s AND sale_date < %s
+            GROUP BY COALESCE(NULLIF(TRIM(staff), ''), 'Not specified')
+            ORDER BY SUM(amount) DESC, staff
+            """,
+            (current_start, next_start),
+        ).fetchall()
+
+        expense_rows = conn.execute(
+            """
+            SELECT id, expense_date, description, amount, source
+            FROM expenses
+            WHERE expense_date >= %s AND expense_date < %s
+            ORDER BY expense_date DESC, id DESC
+            """,
+            (current_start, next_start),
+        ).fetchall()
+
+    sales_total = float(summary["sales"] or 0)
+    expenses_total = float(expense_summary["expenses"] or 0)
+
+    return {
+        "month": current_start.strftime("%Y-%m"),
+        "sales": sales_total,
+        "sale_count": int(summary["sale_count"] or 0),
+        "expenses": expenses_total,
+        "expense_count": int(expense_summary["expense_count"] or 0),
+        "profit": sales_total - expenses_total,
+        "daily_sales": [
+            {
+                "day": r["day"].isoformat(),
+                "visits": int(r["visits"] or 0),
+                "sales": float(r["sales"] or 0),
+            }
+            for r in daily_sales
+        ],
+        "payment_methods": [
+            {
+                "payment_method": r["payment_method"],
+                "visits": int(r["visits"] or 0),
+                "sales": float(r["sales"] or 0),
+            }
+            for r in payment_methods
+        ],
+        "staff": [
+            {
+                "staff": r["staff"],
+                "visits": int(r["visits"] or 0),
+                "sales": float(r["sales"] or 0),
+            }
+            for r in staff
+        ],
+        "expense_rows": [
+            {
+                "id": int(r["id"]),
+                "expense_date": r["expense_date"].isoformat(),
+                "description": r["description"],
+                "amount": float(r["amount"] or 0),
+                "source": r["source"],
+            }
+            for r in expense_rows
+        ],
+    }
+
+
 @app.get("/api/sales")
 def list_sales(
     search: str = "",
