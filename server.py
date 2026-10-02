@@ -1,9 +1,10 @@
 import os
+import json
 import hashlib
 import secrets
-from datetime import date, datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import date, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import psycopg
 from psycopg.rows import dict_row
@@ -14,6 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+SEED_FILE = os.path.join(os.path.dirname(__file__), "historical_seed.json")
+
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
@@ -33,6 +36,94 @@ def db():
 
 def password_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def seed_historical_data(conn) -> None:
+    # Import the historical records only once, when the new V10 sales table is empty.
+    sale_count = conn.execute("SELECT COUNT(*) AS n FROM sales").fetchone()["n"]
+    if int(sale_count) != 0 or not os.path.exists(SEED_FILE):
+        return
+
+    with open(SEED_FILE, encoding="utf-8") as f:
+        seed = json.load(f)
+
+    customer_cache = {}
+
+    def get_customer(name: str, phone: str):
+        key = (name.strip().lower(), phone.strip())
+        if not name.strip():
+            return None
+        if key in customer_cache:
+            return customer_cache[key]
+        row = conn.execute(
+            "SELECT id FROM customers WHERE lower(name)=lower(%s) AND phone=%s ORDER BY id LIMIT 1",
+            (name.strip(), phone.strip()),
+        ).fetchone()
+        if row:
+            customer_cache[key] = int(row["id"])
+            return int(row["id"])
+        row = conn.execute(
+            "INSERT INTO customers(name, phone) VALUES(%s,%s) RETURNING id",
+            (name.strip(), phone.strip()),
+        ).fetchone()
+        customer_cache[key] = int(row["id"])
+        return int(row["id"])
+
+    for item in seed.get("transactions", []):
+        name = str(item.get("customer", "") or "")
+        phone = str(item.get("phone", "") or "")
+        customer_id = get_customer(name, phone)
+        raw_amount = item.get("amount", 0)
+        try:
+            amount = float(raw_amount) if raw_amount not in ("", None) else 0.0
+        except Exception:
+            amount = 0.0
+
+        conn.execute(
+            """
+            INSERT INTO sales(
+                customer_id, sale_date, customer_name, phone, room, staff,
+                service, amount, payment_method, notes
+            )
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                customer_id,
+                item.get("date"),
+                name,
+                phone,
+                str(item.get("room", "") or ""),
+                str(item.get("staff", "") or ""),
+                str(item.get("package", "") or ""),
+                amount,
+                str(item.get("payment", "") or ""),
+                f"Imported historical record S.no {item.get('sno', '')}",
+            ),
+        )
+
+    # Keep historical expenses, but never duplicate them.
+    exp_count = conn.execute("SELECT COUNT(*) AS n FROM expenses").fetchone()["n"]
+    if int(exp_count) == 0:
+        for item in seed.get("expenses", []):
+            raw_amount = item.get("amount", 0)
+            try:
+                amount = float(raw_amount) if raw_amount not in ("", None) else 0.0
+            except Exception:
+                amount = 0.0
+            conn.execute(
+                """
+                INSERT INTO expenses(expense_date, description, amount, source)
+                VALUES(%s,%s,%s,%s)
+                """,
+                (
+                    item.get("date"),
+                    str(item.get("description", "") or ""),
+                    amount,
+                    str(item.get("source", "historical") or "historical"),
+                ),
+            )
+
+    conn.commit()
 
 
 def init_db() -> None:
@@ -104,6 +195,7 @@ def init_db() -> None:
             )
             """
         )
+
         conn.execute(
             """
             INSERT INTO app_users(username, password_hash, role)
@@ -120,6 +212,8 @@ def init_db() -> None:
             """,
             ("staff", password_hash("staff123")),
         )
+
+        seed_historical_data(conn)
         conn.commit()
 
 
@@ -150,25 +244,6 @@ def current_user(authorization: Optional[str] = Header(None)):
 def manager_only(user):
     if user["role"] != "manager":
         raise HTTPException(status_code=403, detail="Manager access required")
-
-
-def upsert_customer(conn, name: str, phone: str) -> Optional[int]:
-    name = (name or "").strip()
-    phone = (phone or "").strip()
-    if not name:
-        return None
-    row = conn.execute(
-        "SELECT id FROM customers WHERE lower(name)=lower(%s) AND phone=%s ORDER BY id LIMIT 1",
-        (name, phone),
-    ).fetchone()
-    if row:
-        conn.execute("UPDATE customers SET updated_at=NOW() WHERE id=%s", (row["id"],))
-        return int(row["id"])
-    row = conn.execute(
-        "INSERT INTO customers(name,phone) VALUES(%s,%s) RETURNING id",
-        (name, phone),
-    ).fetchone()
-    return int(row["id"])
 
 
 class LoginBody(BaseModel):
@@ -206,7 +281,10 @@ def login(body: LoginBody):
         if not user or password_hash(body.password) != user["password_hash"]:
             raise HTTPException(status_code=401, detail="Invalid username or password")
         token = secrets.token_urlsafe(40)
-        conn.execute("INSERT INTO app_sessions(token,username) VALUES(%s,%s)", (token, username))
+        conn.execute(
+            "INSERT INTO app_sessions(token,username) VALUES(%s,%s)",
+            (token, username),
+        )
         conn.commit()
     return {"token": token, "username": username, "role": user["role"]}
 
@@ -235,22 +313,25 @@ def dashboard(user=Depends(current_user)):
             next_start = date(current_start.year + 1, 1, 1)
         else:
             next_start = date(current_start.year, current_start.month + 1, 1)
+
         month = conn.execute(
             """
-            SELECT COALESCE(SUM(amount),0) AS sales,
-                   COUNT(*) AS sale_count
-            FROM sales WHERE sale_date >= %s AND sale_date < %s
+            SELECT COALESCE(SUM(amount),0) AS sales, COUNT(*) AS sale_count
+            FROM sales
+            WHERE sale_date >= %s AND sale_date < %s
             """,
             (current_start, next_start),
         ).fetchone()
+
         exp = conn.execute(
             """
-            SELECT COALESCE(SUM(amount),0) AS expenses,
-                   COUNT(*) AS expense_count
-            FROM expenses WHERE expense_date >= %s AND expense_date < %s
+            SELECT COALESCE(SUM(amount),0) AS expenses, COUNT(*) AS expense_count
+            FROM expenses
+            WHERE expense_date >= %s AND expense_date < %s
             """,
             (current_start, next_start),
         ).fetchone()
+
         daily = conn.execute(
             """
             SELECT sale_date AS day, COALESCE(SUM(amount),0) AS sales, COUNT(*) AS visits
@@ -260,6 +341,7 @@ def dashboard(user=Depends(current_user)):
             LIMIT 10
             """
         ).fetchall()
+
     return {
         "month": current_start.strftime("%Y-%m"),
         "sales": float(month["sales"] or 0),
@@ -268,7 +350,11 @@ def dashboard(user=Depends(current_user)):
         "expense_count": int(exp["expense_count"] or 0),
         "profit": float((month["sales"] or 0) - (exp["expenses"] or 0)),
         "daily": [
-            {"day": r["day"].isoformat(), "sales": float(r["sales"] or 0), "visits": int(r["visits"] or 0)}
+            {
+                "day": r["day"].isoformat(),
+                "sales": float(r["sales"] or 0),
+                "visits": int(r["visits"] or 0),
+            }
             for r in daily
         ],
     }
@@ -295,7 +381,10 @@ def list_sales(
         LIMIT 1000
     """
     with db() as conn:
-        rows = conn.execute(sql, (search, q, q, q, q, sale_date, sale_date, payment_method, payment_method, staff, staff)).fetchall()
+        rows = conn.execute(
+            sql,
+            (search, q, q, q, q, sale_date, sale_date, payment_method, payment_method, staff, staff),
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -305,12 +394,18 @@ def create_sale(body: SaleBody, user=Depends(current_user)):
         customer_id = upsert_customer(conn, body.customer_name, body.phone)
         row = conn.execute(
             """
-            INSERT INTO sales(customer_id,sale_date,customer_name,phone,room,staff,service,amount,payment_method,notes)
+            INSERT INTO sales(
+                customer_id,sale_date,customer_name,phone,room,staff,service,
+                amount,payment_method,notes
+            )
             VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             RETURNING id
             """,
-            (customer_id, body.sale_date, body.customer_name.strip(), body.phone.strip(), body.room,
-             body.staff.strip(), body.service.strip(), body.amount, body.payment_method, body.notes),
+            (
+                customer_id, body.sale_date, body.customer_name.strip(), body.phone.strip(),
+                body.room, body.staff.strip(), body.service.strip(), body.amount,
+                body.payment_method, body.notes,
+            ),
         ).fetchone()
         conn.commit()
     return {"id": int(row["id"])}
@@ -324,12 +419,16 @@ def update_sale(sale_id: int, body: SaleBody, user=Depends(current_user)):
         customer_id = upsert_customer(conn, body.customer_name, body.phone)
         conn.execute(
             """
-            UPDATE sales SET customer_id=%s,sale_date=%s,customer_name=%s,phone=%s,room=%s,
+            UPDATE sales
+            SET customer_id=%s,sale_date=%s,customer_name=%s,phone=%s,room=%s,
                 staff=%s,service=%s,amount=%s,payment_method=%s,notes=%s,updated_at=NOW()
             WHERE id=%s
             """,
-            (customer_id, body.sale_date, body.customer_name.strip(), body.phone.strip(), body.room,
-             body.staff.strip(), body.service.strip(), body.amount, body.payment_method, body.notes, sale_id),
+            (
+                customer_id, body.sale_date, body.customer_name.strip(), body.phone.strip(),
+                body.room, body.staff.strip(), body.service.strip(), body.amount,
+                body.payment_method, body.notes, sale_id,
+            ),
         )
         conn.commit()
     return {"ok": True}
@@ -345,6 +444,25 @@ def delete_sale(sale_id: int, user=Depends(current_user)):
     return {"ok": True}
 
 
+def upsert_customer(conn, name: str, phone: str) -> Optional[int]:
+    name = (name or "").strip()
+    phone = (phone or "").strip()
+    if not name:
+        return None
+    row = conn.execute(
+        "SELECT id FROM customers WHERE lower(name)=lower(%s) AND phone=%s ORDER BY id LIMIT 1",
+        (name, phone),
+    ).fetchone()
+    if row:
+        conn.execute("UPDATE customers SET updated_at=NOW() WHERE id=%s", (row["id"],))
+        return int(row["id"])
+    row = conn.execute(
+        "INSERT INTO customers(name,phone) VALUES(%s,%s) RETURNING id",
+        (name, phone),
+    ).fetchone()
+    return int(row["id"])
+
+
 @app.get("/api/customers")
 def customers(search: str = "", user=Depends(current_user)):
     q = f"%{search.strip()}%"
@@ -352,7 +470,8 @@ def customers(search: str = "", user=Depends(current_user)):
         rows = conn.execute(
             """
             SELECT c.id, c.name, c.phone, COUNT(s.id) AS visits,
-                   MAX(s.sale_date) AS last_visit
+                   MAX(s.sale_date) AS last_visit,
+                   COALESCE(SUM(s.amount),0) AS spend
             FROM customers c
             LEFT JOIN sales s ON s.customer_id=c.id
             WHERE (%s='' OR c.name ILIKE %s OR c.phone ILIKE %s)
@@ -369,13 +488,18 @@ def customers(search: str = "", user=Depends(current_user)):
 @app.get("/api/customers/{customer_id}/history")
 def customer_history(customer_id: int, user=Depends(current_user)):
     with db() as conn:
-        customer = conn.execute("SELECT id,name,phone FROM customers WHERE id=%s", (customer_id,)).fetchone()
+        customer = conn.execute(
+            "SELECT id,name,phone FROM customers WHERE id=%s",
+            (customer_id,),
+        ).fetchone()
         if not customer:
             raise HTTPException(status_code=404, detail="Customer not found")
         visits = conn.execute(
             """
             SELECT id,sale_date,room,staff,service,amount,payment_method,notes
-            FROM sales WHERE customer_id=%s ORDER BY sale_date DESC,id DESC
+            FROM sales
+            WHERE customer_id=%s
+            ORDER BY sale_date DESC,id DESC
             """,
             (customer_id,),
         ).fetchall()
@@ -392,7 +516,8 @@ def list_expenses(search: str = "", expense_date: Optional[date] = None, user=De
             FROM expenses
             WHERE (%s='' OR description ILIKE %s)
               AND (%s IS NULL OR expense_date=%s)
-            ORDER BY expense_date DESC,id DESC LIMIT 1000
+            ORDER BY expense_date DESC,id DESC
+            LIMIT 1000
             """,
             (search, q, expense_date, expense_date),
         ).fetchall()
@@ -403,7 +528,10 @@ def list_expenses(search: str = "", expense_date: Optional[date] = None, user=De
 def create_expense(body: ExpenseBody, user=Depends(current_user)):
     with db() as conn:
         row = conn.execute(
-            "INSERT INTO expenses(expense_date,description,amount,source) VALUES(%s,%s,%s,%s) RETURNING id",
+            """
+            INSERT INTO expenses(expense_date,description,amount,source)
+            VALUES(%s,%s,%s,%s) RETURNING id
+            """,
             (body.expense_date, body.description.strip(), body.amount, body.source),
         ).fetchone()
         conn.commit()
@@ -414,7 +542,11 @@ def create_expense(body: ExpenseBody, user=Depends(current_user)):
 def update_expense(expense_id: int, body: ExpenseBody, user=Depends(current_user)):
     with db() as conn:
         cur = conn.execute(
-            "UPDATE expenses SET expense_date=%s,description=%s,amount=%s,source=%s,updated_at=NOW() WHERE id=%s",
+            """
+            UPDATE expenses
+            SET expense_date=%s,description=%s,amount=%s,source=%s,updated_at=NOW()
+            WHERE id=%s
+            """,
             (body.expense_date, body.description.strip(), body.amount, body.source, expense_id),
         )
         if cur.rowcount == 0:
@@ -440,7 +572,10 @@ def staff_summary(user=Depends(current_user)):
         rows = conn.execute(
             """
             SELECT staff, COUNT(*) AS visits, COALESCE(SUM(amount),0) AS sales
-            FROM sales WHERE staff<>'' GROUP BY staff ORDER BY COUNT(*) DESC, staff
+            FROM sales
+            WHERE staff<>''
+            GROUP BY staff
+            ORDER BY COUNT(*) DESC, staff
             """
         ).fetchall()
     return [dict(r) for r in rows]
@@ -451,4 +586,8 @@ def index():
     return FileResponse(os.path.join(os.path.dirname(__file__), "static", "index.html"))
 
 
-app.mount("/static", StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+app.mount(
+    "/static",
+    StaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")),
+    name="static",
+)
