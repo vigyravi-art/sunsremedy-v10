@@ -342,6 +342,19 @@ def dashboard(user=Depends(current_user)):
             """
         ).fetchall()
 
+        payment_methods = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(TRIM(payment_method), ''), 'Not specified') AS payment_method,
+                   COUNT(*) AS visits,
+                   COALESCE(SUM(amount),0) AS sales
+            FROM sales
+            WHERE sale_date >= %s AND sale_date < %s
+            GROUP BY COALESCE(NULLIF(TRIM(payment_method), ''), 'Not specified')
+            ORDER BY SUM(amount) DESC, payment_method
+            """,
+            (current_start, next_start),
+        ).fetchall()
+
     return {
         "month": current_start.strftime("%Y-%m"),
         "sales": float(month["sales"] or 0),
@@ -356,6 +369,14 @@ def dashboard(user=Depends(current_user)):
                 "visits": int(r["visits"] or 0),
             }
             for r in daily
+        ],
+        "payment_methods": [
+            {
+                "payment_method": r["payment_method"],
+                "visits": int(r["visits"] or 0),
+                "sales": float(r["sales"] or 0),
+            }
+            for r in payment_methods
         ],
     }
 
