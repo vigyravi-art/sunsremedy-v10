@@ -497,6 +497,62 @@ def reports(month: Optional[str] = None, user=Depends(current_user)):
     }
 
 
+
+@app.get("/api/staff/dashboard")
+def staff_dashboard(user=Depends(current_user)):
+    """Today's staff dashboard: current-day totals and payment-method breakdown only."""
+    if user["role"] != "staff":
+        raise HTTPException(status_code=403, detail="Staff dashboard only")
+
+    today_india = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    with db() as conn:
+        sales_summary = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount),0) AS sales, COUNT(*) AS visits
+            FROM sales
+            WHERE sale_date = %s
+            """,
+            (today_india,),
+        ).fetchone()
+
+        expense_summary = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount),0) AS expenses, COUNT(*) AS expense_count
+            FROM expenses
+            WHERE expense_date = %s
+            """,
+            (today_india,),
+        ).fetchone()
+
+        payment_rows = conn.execute(
+            """
+            SELECT COALESCE(NULLIF(TRIM(payment_method), ''), 'Not specified') AS payment_method,
+                   COUNT(*) AS visits,
+                   COALESCE(SUM(amount),0) AS sales
+            FROM sales
+            WHERE sale_date = %s
+            GROUP BY COALESCE(NULLIF(TRIM(payment_method), ''), 'Not specified')
+            ORDER BY SUM(amount) DESC, payment_method
+            """,
+            (today_india,),
+        ).fetchall()
+
+    return {
+        "date": today_india.isoformat(),
+        "sales": float(sales_summary["sales"] or 0),
+        "visits": int(sales_summary["visits"] or 0),
+        "expenses": float(expense_summary["expenses"] or 0),
+        "expense_count": int(expense_summary["expense_count"] or 0),
+        "payment_methods": [
+            {
+                "payment_method": r["payment_method"],
+                "visits": int(r["visits"] or 0),
+                "sales": float(r["sales"] or 0),
+            }
+            for r in payment_rows
+        ],
+    }
+
 @app.get("/api/sales")
 def list_sales(
     search: str = "",
