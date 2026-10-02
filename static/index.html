@@ -235,8 +235,8 @@ async function loadStaffDashboard(){
   const x=await r.json();
   document.getElementById('todayLabel').textContent=fmt(x.date);
   document.getElementById('staffTodayKpis').innerHTML=[
-    ['Today's sales',money(x.sales),`${x.visits} visits recorded today`],
-    ['Today's expenses',money(x.expenses),`${x.expense_count} expenses recorded today`]
+    ["Today's sales",money(x.sales),`${x.visits} visits recorded today`],
+    ["Today's expenses",money(x.expenses),`${x.expense_count} expenses recorded today`]
   ].map(a=>`<div class="card kpi"><div class="label">${esc(a[0])}</div><div class="value">${esc(a[1])}</div><div class="sub">${esc(a[2])}</div></div>`).join('');
   const payments=x.payment_methods||[];
   document.getElementById('staffPaymentCount').textContent=payments.length+' methods used';
