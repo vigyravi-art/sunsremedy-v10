@@ -127,7 +127,12 @@ input,select,textarea{background:#fff;border:1px solid var(--line);border-radius
 <div id="mobileBar" class="mobile-bar"></div>
 
 <script>
-const api=(path,opts={})=>fetch(path,{...opts,headers:{...(opts.headers||{}),'Authorization':'Bearer '+localStorage.getItem('sunsremedy_token'),'Content-Type':'application/json'}});
+const api=(path,opts={})=>{
+  const headers={...(opts.headers||{}),'Content-Type':'application/json'};
+  const token=localStorage.getItem('sunsremedy_token');
+  if(token) headers.Authorization='Bearer '+token;
+  return fetch(path,{...opts,headers});
+};
 let role='manager',editingSale=null,editingExpense=null,salesData=[],expenseData=[],customerVisits={};
 const rooms=['Big Thai Room','Small Thai Room','Middle Room','3rd Room'];
 const payments=['Cash','GPay','Card','Membership','Bank/UPI','Other'];
@@ -137,8 +142,46 @@ const monthName=m=>new Date(m+'-01T00:00:00').toLocaleDateString('en-US',{month:
 const todayIndia=()=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
 const esc=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');clearTimeout(window.__toast);window.__toast=setTimeout(()=>t.classList.remove('show'),2200)}
-async function login(e){e.preventDefault();const u=document.getElementById('username').value.trim(),p=document.getElementById('password').value;document.getElementById('loginError').classList.add('hidden');try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});if(!r.ok)throw Error();const x=await r.json();localStorage.setItem('sunsremedy_token',x.token);role=x.role;showApp();await refreshAll();toast('Signed in successfully')}catch{document.getElementById('loginError').classList.remove('hidden')}}
-async function bootstrap(){const t=localStorage.getItem('sunsremedy_token');if(!t){showLogin();return}try{const r=await api('/api/me');if(!r.ok)throw Error();const x=await r.json();role=x.role;showApp();await refreshAll()}catch{localStorage.removeItem('sunsremedy_token');showLogin()}}
+async function login(e){
+  e.preventDefault();
+  const u=document.getElementById('username').value.trim();
+  const p=document.getElementById('password').value;
+  const err=document.getElementById('loginError');
+  err.classList.add('hidden');
+  try{
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});
+    let x={};
+    try{x=await r.json()}catch{}
+    if(!r.ok){
+      err.textContent=x.detail||'We could not sign you in. Please check your username and password.';
+      err.classList.remove('hidden');
+      return;
+    }
+    localStorage.setItem('sunsremedy_token',x.token);
+    role=x.role;
+    showApp();
+    try{await refreshAll();toast('Signed in successfully')}
+    catch{toast('Signed in. Some data could not be refreshed yet.')}
+  }catch(err2){
+    err.textContent='The server could not be reached. Please refresh the page and try again.';
+    err.classList.remove('hidden');
+  }
+}
+async function bootstrap(){
+  const t=localStorage.getItem('sunsremedy_token');
+  if(!t){showLogin();return}
+  try{
+    const r=await api('/api/me');
+    if(!r.ok)throw Error();
+    const x=await r.json();
+    role=x.role;
+    showApp();
+    try{await refreshAll()}catch{toast('Signed in. Some data could not be refreshed yet.')}
+  }catch{
+    localStorage.removeItem('sunsremedy_token');
+    showLogin();
+  }
+}
 function showLogin(){document.getElementById('loginView').classList.remove('hidden');document.getElementById('appView').classList.add('hidden')}
 function showApp(){document.getElementById('loginView').classList.add('hidden');document.getElementById('appView').classList.remove('hidden');document.body.classList.toggle('staff-mode',role==='staff');document.getElementById('roleChip').innerHTML='<span class="dot"></span>'+(role==='staff'?'Staff':'Manager');document.getElementById('todayLabel').textContent=fmt(todayIndia());buildMobileNav();if(role==='staff')go('staffHome');else go('dashboard')}
 async function logout(){try{await api('/api/logout',{method:'POST'})}catch{}localStorage.removeItem('sunsremedy_token');showLogin();toast('Logged out')}
@@ -146,7 +189,18 @@ const titles={dashboard:['Manager Dashboard','Your business overview at a glance
 function go(page){document.querySelectorAll('.page').forEach(x=>x.classList.remove('active'));const p=document.getElementById(page);if(p)p.classList.add('active');document.querySelectorAll('#desktopNav button,#mobileBar button').forEach(x=>x.classList.toggle('active',x.dataset.page===page));if(titles[page]){document.getElementById('pageTitle').textContent=titles[page][0];document.getElementById('subtitle').textContent=titles[page][1]}}
 document.querySelectorAll('#desktopNav button').forEach(b=>b.addEventListener('click',()=>{if(role==='staff'&&b.classList.contains('manager-nav'))return;go(b.dataset.page);refreshPage(b.dataset.page)}));
 function buildMobileNav(){const items=role==='manager'?[['dashboard','⌂','Home'],['sales','₹','Sales'],['customers','◉','Customers'],['reports','▥','Reports']]:[['staffHome','⌂','Home'],['sales','₹','Sales'],['customers','◉','Customers'],['expenses','＋','Expenses']];document.getElementById('mobileBar').innerHTML=items.map(i=>`<button data-page="${i[0]}" onclick="go('${i[0]}');refreshPage('${i[0]}')"><span class="m-icon">${i[1]}</span>${i[2]}</button>`).join('')}
-async function refreshAll(){await Promise.all([role==='manager'?loadDashboard():Promise.resolve(),loadSales(),loadCustomers(),loadExpenses(),role==='manager'?loadReports():Promise.resolve(),role==='manager'?loadStaff():Promise.resolve(),role==='staff'?loadStaffRecent():Promise.resolve()])}
+async function refreshAll(){
+  const tasks=[
+    role==='manager'?loadDashboard():Promise.resolve(),
+    loadSales(),
+    loadCustomers(),
+    loadExpenses(),
+    role==='manager'?loadReports():Promise.resolve(),
+    role==='manager'?loadStaff():Promise.resolve(),
+    role==='staff'?loadStaffRecent():Promise.resolve()
+  ];
+  await Promise.allSettled(tasks);
+}
 async function refreshCurrent(){const active=document.querySelector('.page.active');if(active)await refreshPage(active.id);toast('Refreshed')}
 async function refreshPage(page){if(page==='dashboard')await loadDashboard();if(page==='staffHome')await loadStaffRecent();if(page==='sales')await loadSales();if(page==='customers')await loadCustomers();if(page==='expenses')await loadExpenses();if(page==='reports')await loadReports();if(page==='staff')await loadStaff()}
 async function loadDashboard(){if(role!=='manager')return;const r=await api('/api/dashboard');if(!r.ok)return;const x=await r.json();const mn=monthName(x.month);document.getElementById('dashboardKpis').innerHTML=[['Current month sales',money(x.sales),'Total recorded sales'],['Current month profit',money(x.profit),'After recorded expenses'],['Sales entries',x.sale_count,'Visits recorded this month'],['Expenses',money(x.expenses),'Recorded this month']].map(a=>`<div class="card kpi"><div class="label">${esc(a[0])}</div><div class="value">${esc(a[1])}</div><div class="sub">${esc(a[2])}</div></div>`).join('');const max=Math.max(1,...x.daily.map(d=>d.sales));document.getElementById('dailyBars').innerHTML=x.daily.map(d=>`<div class="barrow"><span class="barlabel">${fmt(d.day)}</span><div class="bar"><i style="width:${Math.min(100,d.sales/max*100)}%"></i></div><span class="barvalue">${money(d.sales)}</span></div>`).join('')||'<div class="empty">No sales recorded yet.</div>';document.getElementById('monthSummary').innerHTML=`<div class="mini-summary"><div class="mini-line"><span>${mn} sales</span><b>${money(x.sales)}</b></div><div class="mini-line"><span>Expenses</span><b>${money(x.expenses)}</b></div><div class="mini-line"><span>Profit</span><b class="${x.profit>=0?'profit-up':'profit-down'}">${money(x.profit)}</b></div><div class="mini-line"><span>Sales entries</span><b>${x.sale_count}</b></div></div><div class="notice good-note" style="margin-top:14px">These numbers are calculated directly from the cloud sales and expense records.</div>`}
